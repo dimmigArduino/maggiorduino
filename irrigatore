@@ -1,0 +1,545 @@
+* 
+  Irrigatore (per plumeria e balcone) 
+  Controlla umidità terriccio e dai acqua quando serve ed eventualmente una volta la giorno
+  Riscalda la plumeria (o il limone e l'ulivo) d'inverno
+*/
+
+#include <SPI.h>
+#include <WiFi101.h>
+#include <WiFiUdp.h>
+#include <RTCZero.h>
+#include <BlynkSimpleWiFiShield101.h>
+#include <Time.h>
+#include <DHT.h>
+
+// ========================================================================================================
+// Definizioni globali
+// ========================================================================================================
+
+#define BLYNK_PRINT     SerialUSB       // Output su seriale in fase di debug
+#define UMIDITA_UNO            A1       // Sensore capacitivo su Pianta 1
+#define UMIDITA_DUE            A2       // Sensore capacitivo su Pianta 2
+#define TANICA_VUOTA           A3       // Sensore presenza acqua tanica
+#define TEMPERATURA            A4       // Sensore temperatura/umidità DHT11
+#define RELE_POMPA              1       // Relè pompa acceso/spento
+#define LED_ROSSO_POMPA         5       // Led rosso, pompa accesa
+#define RELE_TEMPE              2       // Relè temperatura acceso/spento
+#define LED_GIALLO_TEMPE        4       // Led giallo, temperatura accesa
+#define LOOP_CYCLE           1000       // Intervallo ciclo loop 
+#define SOGLIA_IRRIGAZIONE_1 9999       // Valore empirico misurato nel tempo (9999=ignora)
+#define SOGLIA_IRRIGAZIONE_2 9999       // Valore empirico misurato nel tempo (9999=ignora)
+#define BLYNK_IRRIGATORE_LOG   V1       // Log operazioni su app Blynk
+#define BLYNK_MANUALE          V2       // Switch su app che mette in manuale il sistema
+#define BLYNK_POMPAACCESA      V3       // Switch che accende/spegne la pompa manualmente
+#define BLYNK_CLEAR_VLOG       V4       // Pulisce il log Blynk
+#define BLYNK_ORA_IRRIGAZIONE  V5       // Cambio ora irrigazione da Blynk
+#define BLYNK_LED_TANICA_VUOTA V6       // Avvisa su Blynk che la tanica è vuota
+#define BLYNK_RISCALDATORE     V7       // Switch che accende/spegne il riscaldatore manualmente
+#define BLYNK_LIM_RISCALDATORE V8       // Valore acquisito dall'app come trigger riscaldamento
+#define BLYNK_TEMPERATURA      V9       // Temperatura ambiente 
+#define BLYNK_UMIDITA         V10       // Umidità ambiente 
+#define DHTTYPE             DHT11       // DHT 11 - il tipo di sensore temperatura/umidità
+// ========================================================================================================
+// Global variables
+// ========================================================================================================
+
+WidgetTerminal                vLog(BLYNK_IRRIGATORE_LOG);              // Widget dell'app che fa il log
+WidgetLED                     vLedTanica(BLYNK_LED_TANICA_VUOTA);      // Widget dell'app Blynk (simula un led)
+RTCZero                       rtc;                                     // Real Time Clock
+DHT                           dht(TEMPERATURA,DHTTYPE);                // Gestione del DHT11
+char ssid[]                 = SECRET_SSID;                             // Network SSID
+char pass[]                 = SECRET_PASS;                             // Network password
+int status                  = WL_IDLE_STATUS;
+char auth[]                 = "secret";      // Blynk Auth Token "Irrigatore Finale"
+char dem[5];                                                           // buffer per allineamento ora/minuti su (due) digit
+String mesi[12] = {"Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"};
+bool irrigazioneManuale     =false;
+bool pompaAccesaManuale     =false;
+bool irrigazioneInCorso     =false;
+bool riscaldamentoInCorso   =false;
+bool set_clear_log          = true;
+bool fineAcqua              =false;
+// Orario di default di partenza dell'irrigazione automatica (1:30 AM per 1 minuto)
+byte oraInizioIrrigazione   =1;                                        
+byte minutoInizioIrrigazione=30;               
+byte oraFineIrrigazione     =1;                   
+byte minutoFineIrrigazione  =31;     
+// --------------------------------------------------------------------------------
+// Soglia di default sotto la quale viene acceso il riscaldatore (se è collegato...)
+byte sogliaTemperatura      =23;
+float temperaturaAmbiente   =0;
+float umiditaAmbiente       =0;
+
+// ========================================================================================================
+// Set-up ambiente, wifi, blynk. Leggere i risultati sulla console. 
+// Lasciare i delay altrimenti non fa in tempo ad aprire la console.
+// Alla fine riporta i dati nell'app Blynk
+// ========================================================================================================
+
+void setup() {
+  
+  // Settaggi pin di partenza
+  pinMode(RELE_POMPA, OUTPUT);
+  digitalWrite(RELE_POMPA, LOW);
+  pinMode(LED_ROSSO_POMPA, OUTPUT);
+  digitalWrite(LED_ROSSO_POMPA, LOW);
+  
+  pinMode(RELE_TEMPE, OUTPUT);
+  digitalWrite(RELE_TEMPE, LOW);
+  pinMode(LED_GIALLO_TEMPE, OUTPUT);
+  digitalWrite(LED_GIALLO_TEMPE, LOW);
+  
+  pinMode(UMIDITA_UNO, INPUT);
+  pinMode(UMIDITA_DUE, INPUT);
+  pinMode(TANICA_VUOTA,INPUT); 
+  pinMode(TEMPERATURA,INPUT); 
+
+  Serial.begin(115200);
+  delay(10000);
+
+  if (WiFi.status() == WL_NO_SHIELD) 
+  { Serial.println("WiFi non funzionante (stop)");
+    while (true);
+  }
+
+  while ( status != WL_CONNECTED) 
+  { Serial.print("Connessione in corso a: ");
+    Serial.println(ssid);
+    status = WiFi.begin(ssid, pass);
+   if ( status != WL_CONNECTED ) { delay(5000); }
+  }
+
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+  IPAddress ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+  long rssi = WiFi.RSSI();
+  Serial.print("Potenza segnale (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+
+  // inizializzazione real time clock, lettura dell'ora dalla wifi, settaggio fuso orario, incluso ora legale
+  rtc.begin();
+  Serial.print("Recupero data e ora");
+
+  unsigned long epoch;
+  int numberOfTries = 0, maxTries = 15;
+  do 
+    { epoch = WiFi.getTime();
+      Serial.print(".");
+      numberOfTries++;
+      if (epoch==0) { delay(5000); }
+    }
+  while ((epoch == 0) && (numberOfTries < maxTries));
+  if (numberOfTries == maxTries) 
+  { Serial.println("Server data/ora non raggiungibile...");
+  }
+  else 
+  { Serial.println(".");
+    Serial.println("Data e ora internazionale");
+    rtc.setEpoch(epoch);
+    printDate();
+    printTime();
+    epoch = epoch + adjustDstEurope();
+    Serial.println();
+    Serial.print("Ora CET ricalcolata ");
+    rtc.setEpoch(epoch);
+    printTime();
+    Serial.println();
+  }
+  
+  // crea l'allarme di inizio irrigazione 
+  rtc.setAlarmTime(oraInizioIrrigazione,minutoInizioIrrigazione,0);
+  rtc.enableAlarm(rtc.MATCH_HHMMSS);
+  rtc.attachInterrupt(irrigationBegin);
+
+  // si collega a Blynk
+  Serial.print("Connessione a Blynk..");
+  Blynk.begin(auth, ssid, pass);  
+  status=Blynk.connect();
+  while ( !status ) 
+  { Serial.print(".");
+    delay(1000);
+    status=Blynk.connect();
+  }
+
+  // il led virtuale su Blynk che mi dice che la tanica è vuota
+  vLedTanica.off();  
+  Serial.println();
+  
+  // inizializzazione sensore temperatura/pressione DHT11
+  dht.begin(); 
+  dht.read(TEMPERATURA);
+  Serial.print("Umidità = ");
+  Serial.print(dht.readHumidity());
+  Serial.println("%");
+  Serial.print("Temperatura = ");
+  Serial.print(dht.readTemperature()); 
+  Serial.println("°C");
+  Serial.println();
+  
+  Serial.println("Controllo irrigatore Online!");
+
+}
+
+// ========================================================================================================
+// Main Loop
+// ========================================================================================================
+
+void loop() {
+  
+  int terriccio_uno = analogRead(UMIDITA_UNO);
+  int terriccio_due = analogRead(UMIDITA_DUE);
+  bool Liquid_level=(digitalRead(TANICA_VUOTA) == HIGH);
+  temperaturaAmbiente = dht.readTemperature();
+  umiditaAmbiente = dht.readHumidity();
+
+
+  // irriga se il terriccio è secco (sempre che ci sia acqua e l'irrigazione non sia in mauale)
+  
+  if (!irrigazioneManuale)
+  { if (terriccio_uno>SOGLIA_IRRIGAZIONE_1 or terriccio_due>SOGLIA_IRRIGAZIONE_2) 
+    { vLog.print("Innaffiamento per aridità");
+      if (!fineAcqua) 
+      { vLog.println(); 
+        pompaOnOff(HIGH); 
+        irrigazioneInCorso=true;
+      }
+      else { vLog.println(", ma acqua finita"); }
+    }
+    else { if (irrigazioneInCorso) 
+            { pompaOnOff(LOW); 
+              irrigazioneInCorso=false;
+            } 
+          }
+  }
+  
+  if (temperaturaAmbiente<sogliaTemperatura)
+  { if (!riscaldamentoInCorso)
+    { digitalWrite(RELE_TEMPE, HIGH);
+      digitalWrite(LED_GIALLO_TEMPE, HIGH);
+      vLog.println("Accensione automatica riscaldatore "); 
+      riscaldamentoInCorso=true;
+    }
+  } 
+  else 
+  { if (riscaldamentoInCorso)
+    { digitalWrite(RELE_TEMPE, LOW);
+      digitalWrite(LED_GIALLO_TEMPE, LOW);
+      vLog.println("Spegnimento automatico riscaldatore "); 
+      riscaldamentoInCorso=false;
+    }
+  }  
+  
+  if (set_clear_log) 
+  { vLog.clear();
+    vLog.println("Irrigatore OnLine");
+    vLogprintWiFiStatus();
+    vLogprintDate();
+    vLogprintTime(rtc.getHours(),rtc.getMinutes());
+    vLog.print("Ora prevista inizio irrigazione: ");
+    vLogprintTime(oraInizioIrrigazione,minutoInizioIrrigazione);
+    vLog.print("Ora prevista fine irrigazione: ");
+    vLogprintTime(oraFineIrrigazione,minutoFineIrrigazione);
+    vLog.print("Temperatura Ambiente: ");
+    vLog.print(temperaturaAmbiente);
+    vLog.println("ºC");
+    vLog.print("Umidità Ambiente: ");
+    vLog.print(umiditaAmbiente);
+    vLog.println("%");
+    vLog.print("Soglia accensione riscaldatore:");
+    vLog.print(sogliaTemperatura);
+    vLog.println("ºC");
+    set_clear_log=false;
+  }
+  
+  if (!Liquid_level) 
+  { vLog.println("**Tanica vuota**");
+    Blynk.notify("Tanica irrigatore vuota!");
+    vLedTanica.on();
+  }
+  else { vLedTanica.off(); }
+
+  vLog.flush();
+  Blynk.run();
+  delay(LOOP_CYCLE); 
+  
+}
+
+// ========================================================================================================
+// Funzioni e procedure
+// ========================================================================================================
+
+void printTime()
+{
+  Serial.print(demCast(rtc.getHours()));
+  Serial.print(":");
+  Serial.print(demCast(rtc.getMinutes()));
+  Serial.println();
+}
+
+void printDate()
+{
+  Serial.print(rtc.getDay());
+  Serial.print("-");
+  Serial.print(mesi[rtc.getMonth()-1]);
+  Serial.print("-20");
+  Serial.print(rtc.getYear());
+  Serial.print(" ");
+}
+
+void vLogprintTime(int Ora, int Minuti)
+{
+  vLog.print(demCast(Ora));
+  vLog.print(":");
+  vLog.print(demCast(Minuti));
+  vLog.println();
+}
+
+void vLogprintDate()
+{
+  vLog.print(rtc.getDay());
+  vLog.print("-");
+  vLog.print(mesi[rtc.getMonth()-1]);
+  vLog.print("-20");
+  vLog.print(rtc.getYear());
+  vLog.print(" ");
+}
+
+void vLogprintWiFiStatus() {
+  vLog.print("SSID: ");
+  vLog.println(WiFi.SSID());
+  IPAddress ip = WiFi.localIP();
+  vLog.print("IP Address: ");
+  vLog.println(ip);
+  long rssi = WiFi.RSSI();
+  vLog.print("Potenza segnale (RSSI):");
+  vLog.print(rssi);
+  vLog.println(" dBm");
+}
+
+
+// ========================================================================================================
+// Azione da Blynk BLYNK_MANUALE = mette in manuale la pompa
+// ========================================================================================================
+
+BLYNK_WRITE(BLYNK_MANUALE) 
+{ 
+  irrigazioneManuale = (param.asInt()==1);
+  if (irrigazioneManuale) {
+    vLog.println("Irrigazione Manuale");
+    Serial.println("Irrigazione Manuale");
+  } else {  vLog.println("Irrigazione Automatica"); 
+            Serial.println("Irrigazione Automatica");
+  }
+}
+
+// ========================================================================================================
+// Azione da Blynk BLYNK_RISCALDATORE = accende il riscaldatore
+// ========================================================================================================
+
+BLYNK_READ(BLYNK_TEMPERATURA)
+{ 
+  Blynk.virtualWrite(BLYNK_TEMPERATURA, temperaturaAmbiente);
+  
+}
+
+BLYNK_READ(BLYNK_UMIDITA)
+{ 
+  Blynk.virtualWrite(BLYNK_UMIDITA, umiditaAmbiente);
+  
+}
+
+BLYNK_WRITE(BLYNK_LIM_RISCALDATORE) 
+{ 
+   sogliaTemperatura=param.asInt();
+}
+
+BLYNK_WRITE(BLYNK_RISCALDATORE) 
+{ 
+  bool riscaldatoreAcceso = (param.asInt()==1);
+ 
+  if (riscaldatoreAcceso) 
+  { 
+    digitalWrite(RELE_TEMPE, HIGH);
+    digitalWrite(LED_GIALLO_TEMPE, HIGH);
+    vLog.println("Accensione manuale riscaldatore "); 
+  } 
+  else 
+  {  
+    digitalWrite(RELE_TEMPE, LOW);
+    digitalWrite(LED_GIALLO_TEMPE, LOW);
+    vLog.println("Spegnimento manuale riscaldatore "); 
+  }
+}
+
+// ========================================================================================================
+// Azione da Blynk BLYNK_CLEAR_VLOG = pulisce il log
+// ========================================================================================================
+
+BLYNK_WRITE(BLYNK_CLEAR_VLOG) 
+{ 
+  if (!set_clear_log)
+  { set_clear_log=(param.asInt()==1);
+  }
+}
+
+
+
+
+// ========================================================================================================
+// Azione da Blynk BLYNK_ORA_IRRIGAZIONE = orario di irrigazione
+// ========================================================================================================
+
+
+BLYNK_WRITE(BLYNK_ORA_IRRIGAZIONE) {
+  long startTimeInSecs = param[0].asLong();  
+  long endTimeInSecs = param[1].asLong();   
+  
+  // Estraggo la nuova ora di inizio irrigazione
+  oraInizioIrrigazione=byte(startTimeInSecs / 3600);
+  minutoInizioIrrigazione=byte((startTimeInSecs % 3600) / 60);
+  oraFineIrrigazione=byte(endTimeInSecs / 3600);
+  minutoFineIrrigazione=byte((endTimeInSecs % 3600) / 60);
+
+  // Riprogrammo il timer di inizio irrigazione
+  rtc.disableAlarm();
+  rtc.setAlarmTime(oraInizioIrrigazione,minutoInizioIrrigazione,0);
+  rtc.enableAlarm(rtc.MATCH_HHMMSS);
+  rtc.attachInterrupt(irrigationBegin);
+
+  vLog.println("Riprogrammazione completata");
+  vLog.print("Inizio irrigazione: ");
+  vLogprintTime(oraInizioIrrigazione,minutoInizioIrrigazione);
+  vLog.print("Fine irrigazione: ");
+  vLogprintTime(oraFineIrrigazione,minutoFineIrrigazione);
+
+
+}  
+  
+// ========================================================================================================
+// Azione da Blynk BLYNK_POMPAACCESA = accende e spegne la pompa di irrigazione se in manuale
+// ========================================================================================================
+
+BLYNK_WRITE(BLYNK_POMPAACCESA) 
+{ 
+  pompaAccesaManuale = (param.asInt()==1);
+  if (irrigazioneManuale) { 
+    if (pompaAccesaManuale) { 
+      pompaOnOff(HIGH); 
+    } 
+    else {  
+      pompaOnOff(LOW); 
+    }
+  } 
+  else {  
+    vLog.println("Tentata accensione pompa, ma sistema in automatico"); 
+    Serial.println("Tentata accensione pompa, ma sistema in automatico");
+  }
+}
+
+// ========================================================================================================
+
+void vLogDateTime()
+{
+        vLog.print(demCast(rtc.getDay()));
+        vLog.print("/");
+        vLog.print(demCast(rtc.getMonth()));
+        vLog.print(" ");
+        vLog.print(demCast(rtc.getHours()));
+        vLog.print(":");
+        vLog.println(demCast(rtc.getMinutes()));
+}
+
+// ========================================================================================================
+
+void pompaOnOff(int statusPompa)
+{
+        digitalWrite(RELE_POMPA, statusPompa);
+        digitalWrite(LED_ROSSO_POMPA, statusPompa);
+        
+        if (statusPompa==HIGH) {
+          vLog.print("- Pompa accesa ");
+          Serial.println("Pompa accesa");
+        } else {
+        vLog.print("- Pompa spenta ");
+        Serial.println("Pompa spenta");
+        }
+        vLogDateTime();
+}
+
+// Lanciata in automatico alla scadenza del timer
+
+void irrigationBegin()
+{ 
+  vLog.print("Inizio irrigazione");
+  if (!irrigazioneManuale) 
+  { if (!fineAcqua) 
+    { vLog.println();
+      pompaOnOff(HIGH); 
+      // Mette un allarme all'ora di fine dell'irrigazione
+      rtc.disableAlarm();
+      rtc.setAlarmTime(oraFineIrrigazione,minutoFineIrrigazione,0);
+      rtc.enableAlarm(rtc.MATCH_HHMMSS);
+      rtc.attachInterrupt(irrigationEnd);
+    } 
+    else { vLog.println(", ma acqua finita"); }
+  } 
+  else { vLog.println(", ma pompa in manuale"); }
+}
+
+// ========================================================================================================
+// Lanciata in automatico alla scadenza del timer
+
+void irrigationEnd()
+{
+  if (!irrigazioneManuale) 
+  { pompaOnOff(int LOW);
+    vLog.println("Fine irrigazione");
+  } 
+  else { vLog.println("Fine irrigazione, ma pompa in manuale"); }
+
+  // Rimette l'allarme all'ora di inizio dell'irrigazione
+  rtc.disableAlarm();
+  rtc.setAlarmTime(oraInizioIrrigazione,minutoInizioIrrigazione,0);
+  rtc.enableAlarm(rtc.MATCH_HHMMSS);
+  rtc.attachInterrupt(irrigationBegin);
+  
+}
+
+// ========================================================================================================
+// Adegua l'ora considerando CET ed ora legale
+
+int adjustDstEurope()
+{
+ // ultima domenica di marzo
+ int beginDSTDate=  (31 - (5* rtc.getYear() /4 + 4) % 7);
+ Serial.println("Ora legale: ");
+ Serial.print(beginDSTDate);
+ Serial.println(" di Marzo");
+ int beginDSTMonth=3;
+ //ultima domenica di ottobre
+ int endDSTDate= (31 - (5 * rtc.getYear() /4 + 1) % 7);
+ Serial.print(endDSTDate);
+ Serial.println( " di Ottobre" );
+ int endDSTMonth=10;
+ // calcolo ora solare/legale CET
+ if (((rtc.getMonth() > beginDSTMonth) && (rtc.getMonth() < endDSTMonth))
+     || ((rtc.getMonth() == beginDSTMonth) && (rtc.getDay() >= beginDSTDate)) 
+     || ((rtc.getMonth() == endDSTMonth) && (rtc.getDay() <= endDSTDate)))
+ return (7200);  // DST europe = utc +2 hour
+ else return (3600); // nonDST europe = utc +1 hour
+}
+
+// ========================================================================================================
+// Allinea su due cifre l'ora o i minuti
+
+char* demCast(int num)
+{
+ memset (dem, 0, sizeof(dem));
+ if (num<10) { snprintf(dem, sizeof(dem)-1, "0%d", num); }
+ else { snprintf(dem, sizeof(dem)-1, "%d", num); }
+  
+return dem;
+}
